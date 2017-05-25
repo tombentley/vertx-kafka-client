@@ -16,13 +16,19 @@
 
 package io.vertx.kafka.client.consumer.impl;
 
-import io.vertx.core.AsyncResult;
-import io.vertx.core.Context;
-import io.vertx.core.Future;
-import io.vertx.core.Handler;
-import io.vertx.kafka.client.common.impl.Helper;
-import io.vertx.kafka.client.consumer.KafkaConsumerRecord;
-import io.vertx.kafka.client.consumer.KafkaReadStream;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
+
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -34,18 +40,12 @@ import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
 
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BiConsumer;
+import io.vertx.core.AsyncResult;
+import io.vertx.core.Context;
+import io.vertx.core.Future;
+import io.vertx.core.Handler;
+import io.vertx.kafka.client.common.impl.Helper;
+import io.vertx.kafka.client.consumer.KafkaReadStream;
 
 /**
  * Kafka read stream implementation
@@ -61,7 +61,7 @@ public class KafkaReadStreamImpl<K, V> implements KafkaReadStream<K, V> {
   private final AtomicBoolean consuming = new AtomicBoolean(false);
   private final AtomicBoolean paused = new AtomicBoolean(false);
   private Handler<ConsumerRecord<K, V>> recordHandler;
-  private Iterator<ConsumerRecord<K, V>> current; // Accessed on event loop
+  private Buffer<TopicPartition, ConsumerRecord<K, V>> current = new Buffer<>(); // Accessed on event loop
   private Handler<ConsumerRecords<K, V>> batchHandler;
   private Handler<Set<TopicPartition>> partitionsRevokedHandler;
   private Handler<Set<TopicPartition>> partitionsAssignedHandler;
@@ -161,13 +161,15 @@ public class KafkaReadStreamImpl<K, V> implements KafkaReadStream<K, V> {
     if (this.closed.get()) {
       return;
     }
-
-    if (this.current == null || !this.current.hasNext()) {
+    ConsumerRecord<K, V> next2 = this.current.next();
+    if (next2 == null) {
 
       this.pollRecords(records -> {
 
         if (records != null && records.count() > 0) {
-          this.current = records.iterator();
+          for (TopicPartition tp : records.partitions()) {
+            this.current.add(tp, records.records(tp));
+          }
           if (batchHandler != null) {
             batchHandler.handle(records);
           }
@@ -180,15 +182,19 @@ public class KafkaReadStreamImpl<K, V> implements KafkaReadStream<K, V> {
     } else {
 
       int count = 0;
-      while (this.current.hasNext() && count++ < 10) {
+      while (next2 != null) {
 
         // to honor the Vert.x ReadStream contract, handler should not be called if stream is paused
         if (this.paused.get())
           break;
 
-        ConsumerRecord<K, V> next = this.current.next();
         if (handler != null) {
-          handler.handle(next);
+          handler.handle(next2);
+        }
+        if (count++ < 10) {
+          next2 = this.current.next();
+        } else {
+          break;
         }
       }
       this.schedule(0);
@@ -214,6 +220,7 @@ public class KafkaReadStreamImpl<K, V> implements KafkaReadStream<K, V> {
 
     this.submitTask((consumer, future) -> {
       consumer.pause(topicPartitions);
+      this.current.pause(topicPartitions);
       if (future != null) {
         future.complete();
       }
@@ -242,6 +249,7 @@ public class KafkaReadStreamImpl<K, V> implements KafkaReadStream<K, V> {
   public KafkaReadStream<K, V> resume(Set<TopicPartition> topicPartitions, Handler<AsyncResult<Void>> completionHandler) {
 
     this.submitTask((consumer, future) -> {
+      this.current.resume(topicPartitions);
       consumer.resume(topicPartitions);
       if (future != null) {
         future.complete();
@@ -272,6 +280,7 @@ public class KafkaReadStreamImpl<K, V> implements KafkaReadStream<K, V> {
 
     this.submitTask((consumer, future) -> {
       consumer.seekToEnd(topicPartitions);
+      this.current.flush(topicPartitions);
       if (future != null) {
         future.complete();
       }
@@ -290,6 +299,7 @@ public class KafkaReadStreamImpl<K, V> implements KafkaReadStream<K, V> {
 
     this.submitTask((consumer, future) -> {
       consumer.seekToBeginning(topicPartitions);
+      this.current.flush(topicPartitions);
       if (future != null) {
         future.complete();
       }
@@ -305,9 +315,9 @@ public class KafkaReadStreamImpl<K, V> implements KafkaReadStream<K, V> {
 
   @Override
   public KafkaReadStream<K, V> seek(TopicPartition topicPartition, long offset, Handler<AsyncResult<Void>> completionHandler) {
-
     this.submitTask((consumer, future) -> {
       consumer.seek(topicPartition, offset);
+      this.current.flush(topicPartition);
       if (future != null) {
         future.complete();
       }
@@ -337,7 +347,11 @@ public class KafkaReadStreamImpl<K, V> implements KafkaReadStream<K, V> {
   public KafkaReadStream<K, V> subscribe(Set<String> topics, Handler<AsyncResult<Void>> completionHandler) {
 
     BiConsumer<Consumer<K, V>, Future<Void>> handler = (consumer, future) -> {
+      List<TopicPartition> removed = consumer.assignment().stream()
+          .filter(tp->!topics.contains(tp.topic()))
+          .collect(Collectors.toList());
       consumer.subscribe(topics, this.rebalanceListener);
+      this.current.flush(removed);
       this.startConsuming();
       if (future != null) {
         future.complete();
@@ -393,7 +407,11 @@ public class KafkaReadStreamImpl<K, V> implements KafkaReadStream<K, V> {
   public KafkaReadStream<K, V> assign(Set<TopicPartition> partitions, Handler<AsyncResult<Void>> completionHandler) {
 
     BiConsumer<Consumer<K, V>, Future<Void>> handler = (consumer, future) -> {
+      List<TopicPartition> removed = consumer.assignment().stream()
+          .filter(tp->!partitions.contains(tp))
+          .collect(Collectors.toList());
       consumer.assign(partitions);
+      this.current.flush(removed);
       this.startConsuming();
       if (future != null) {
         future.complete();
